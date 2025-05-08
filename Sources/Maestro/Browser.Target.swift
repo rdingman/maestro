@@ -32,6 +32,11 @@ extension Browser.Target {
         let targetInfo: Info
     }
 
+    struct DetachedFromTargetEvent: Browser.Client.Event {
+        let sessionId: String
+        let targetId: String?
+    }
+
     struct TargetDestroyedEvent: Browser.Client.Event {
         let targetId: String
     }
