@@ -1,0 +1,283 @@
+
+import AsyncAlgorithms
+import Foundation
+import OSLog
+import Subprocess
+import System
+
+extension Browser {
+    actor Client {
+        enum State {
+            case initial
+            case launching
+            case connecting(URL)
+            case connected(Browser.Launcher, URLSessionWebSocketTask, Task<Void, Never>)
+            case stopped
+        }
+
+        // ./chrome-headless-shell --headless  --remote-debugging-port=0      ~/Downloads/chrome-headless-shell-mac-arm64
+
+        deinit {
+            print("*** Deinit")
+        }
+
+        let logger = Logger(subsystem: "Maestro", category: "Chrome DevTools Protocol")
+
+        private var state: State = .initial
+
+        func launch() async throws {
+            state = .launching
+            let browserLauncher = Browser.Launcher()
+            let url = try await browserLauncher.launch()
+
+            state = .connecting(url)
+
+            let webSocketTask = URLSession.shared.webSocketTask(with: url)
+
+            let receiveMessagesTask = Task {
+                await receiveMessages(from: webSocketTask)
+            }
+
+            state = .connected(browserLauncher, webSocketTask, receiveMessagesTask)
+
+            webSocketTask.resume()
+        }
+
+        func close() async throws {
+            if case .connected(let launcher, let uRLSessionWebSocketTask, let task) = state {
+                task.cancel()
+                uRLSessionWebSocketTask.cancel()
+                try await launcher.close()
+                state = .stopped
+            }
+        }
+
+        private var voidContinuations: [Int: CheckedContinuation<Void, Swift.Error>] = [:]
+        private var continuations: [Int: any Continuation] = [:]
+        private var nextCommandId: Int = 1
+
+        fileprivate protocol Continuation {
+            associatedtype T: Sendable & Decodable
+
+            func resume(returning value: sending T)
+            func resume(throwing error: any Swift.Error)
+        }
+
+        private var eventTypes: [String: any Event.Type] = [:]
+        let channel = AsyncChannel<any Event>()
+
+        func registerEventType<E: Event>(_ eventType: E.Type) {
+            let name = eventType.name
+            logger.debug("Registering event: \(name), type: \(String(reflecting: eventType))")
+            eventTypes[name] = eventType
+        }
+
+        func registerEventTypes(_ eventTypes: any Sequence<any Event.Type>) {
+            for eventType in eventTypes {
+                self.registerEventType(eventType)
+            }
+        }
+    }
+}
+
+extension Browser.Client {
+    protocol Command<Response, Parameters> {
+        associatedtype Parameters: Encodable
+        associatedtype Response //: Decodable
+        var method: String { get }
+        var params: Parameters { get }
+
+    }
+
+    enum Response {
+        struct Empty: Decodable {}
+    }
+
+    private struct CommandEnvelope<C: Command>: Encodable {
+        let id: Int
+        let sessionId: String?
+        let command: C
+
+        enum CodingKeys: CodingKey {
+            case id
+            case sessionId
+            case method
+            case params
+        }
+
+        func encode(to encoder: any Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(id, forKey: .id)
+            try container.encodeIfPresent(sessionId, forKey: .sessionId)
+            try container.encode(command.method, forKey: .method)
+            try container.encode(command.params, forKey: .params)
+        }
+    }
+
+    func sendCommand<C: Command>(_ command: C, to sessionId: String? = nil) async throws -> C.Response where C.Response == Void {
+        let commandId = try await sendMessage(command, to: sessionId)
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Swift.Error>) in
+            voidContinuations[commandId] = continuation
+        }
+    }
+
+    func sendCommand<C: Command>(_ command: C, to sessionId: String? = nil) async throws -> C.Response where C.Response: Decodable {
+        let commandId = try await sendMessage(command, to: sessionId)
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<C.Response, Swift.Error>) in
+            continuations[commandId] = continuation
+        }
+    }
+
+    private func sendMessage<C: Command>(_ command: C, to sessionId: String?) async throws -> Int {
+        guard case .connected(_, let task, _) = state else {
+            fatalError("Not connected")
+        }
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes, .sortedKeys]
+
+        let commandId = nextCommandId
+        let commentEnvelope = CommandEnvelope(id: commandId, sessionId: sessionId, command: command)
+
+        let messageData = try encoder.encode(commentEnvelope)
+        let string = String(decoding: messageData, as: UTF8.self)
+        logger.debug("⬅︎ \(string)")
+        //        try await task.send(.data(Data(string.utf8)))
+        try await task.send(.string(string))
+
+        nextCommandId += 1
+        return commandId
+    }
+}
+
+extension Browser.Client.Event {
+    static var name: String {
+        let fullyQualifiedName = String(reflecting: Self.self)
+        let components = fullyQualifiedName.split(separator: ".").suffix(2)
+
+        if components.count == 2, let eventDomain = components.first, let last = components.last {
+            let withoutSuffix = last.hasSuffix("Event") ? String(last.dropLast(5)) : String(last)
+            let eventName = withoutSuffix.prefix(1).lowercased() + withoutSuffix.dropFirst()
+            return "\(eventDomain).\(eventName)"
+        } else {
+            return fullyQualifiedName
+        }
+    }
+}
+
+extension Browser.Client {
+    protocol Event: Decodable, Sendable {
+        static var name: String { get }
+    }
+
+    private struct ResponseEnvelope<Response: Decodable>: Decodable {
+        let id: Int
+        let sessionId: String?
+        let result: Response?
+        let error: Error?
+    }
+
+    struct Error: Decodable, Swift.Error {
+        let code: Int
+        let message: String
+    }
+
+    private func receiveMessages(from task: URLSessionWebSocketTask) async {
+        while Task.isCancelled == false {
+            do {
+                let result = try await task.receive()
+
+                guard Task.isCancelled == false else { return }
+
+                let resultData: Data
+                switch result {
+                case .data(let data):
+                    resultData = data
+
+                case .string(let string):
+                    resultData = Data(string.utf8)
+
+                @unknown default:
+                    resultData = Data()
+                }
+
+                let decoder = JSONDecoder()
+                struct Envelope: Decodable {
+                    let id: Int?
+                    let method: String?
+                }
+                // TODO: Find a better way to peek at the 'id' property in the response
+                // to figure out the real type to decode
+                let envelope = try decoder.decode(Envelope.self, from: resultData)
+
+                if let responseId = envelope.id {
+                    logger.debug("⮕ \(String(decoding: resultData, as: UTF8.self))")
+
+                    if let continuation = voidContinuations[responseId] {
+                        voidContinuations[responseId] = nil
+                        continuation.resume(returning: ())
+                    } else if let continuation = continuations[responseId] {
+                        continuations[responseId] = nil
+                        self.decodeMessage(resultData, resumingWith: continuation)
+                    } else {
+                        print("*** Could not find continuation for id \(responseId)")
+                        continue
+                    }
+
+                } else if let method = envelope.method {
+                    logger.debug("⚠️ \(String(decoding: resultData, as: UTF8.self))")
+
+                    if let eventType = eventTypes[method] {
+                        let event = try decodeEvent(eventType, from: resultData)
+                        await channel.send(event)
+                    } else {
+                        logger.error("**** No event type found for method: \(method)")
+                    }
+                } else {
+                    logger.error("Unknown message received: \(String(decoding: resultData, as: UTF8.self))")
+                }
+
+            } catch {
+                if (error as NSError).domain == NSPOSIXErrorDomain && (error as NSError).code == Errno.socketNotConnected.rawValue {
+                    return
+                }
+                // TODO: ignore errors for now
+                logger.error("Error: \(error)")
+            }
+        }
+    }
+
+    private struct EventEnvelope<T: Event>: Decodable {
+        let method: String
+        let params: T
+    }
+
+    private func decodeEvent<T: Event>(_ type: T.Type, from data: Data) throws -> T {
+        let decoder = JSONDecoder()
+        return try decoder.decode(EventEnvelope<T>.self, from: data).params
+    }
+
+    private func decodeMessage<C: Continuation>(_ data: Data, resumingWith continuation: C) where C.T: Decodable {
+        do {
+            let decoder = JSONDecoder()
+            decoder.dataDecodingStrategy = .base64
+            let response = try decoder.decode(ResponseEnvelope<C.T>.self, from: data)
+
+            if let result = response.result {
+                continuation.resume(returning: result)
+            } else if let error = response.error {
+                continuation.resume(throwing: error)
+            } else {
+                let error = Error(code: 0, message: "Missing result or error in response")
+                continuation.resume(throwing: error)
+            }
+        } catch {
+            continuation.resume(throwing: error)
+        }
+    }
+
+}
+
+extension CheckedContinuation: Browser.Client.Continuation where T: Decodable, E == Swift.Error {
+
+}
