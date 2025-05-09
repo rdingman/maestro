@@ -1,5 +1,6 @@
 
 import Foundation
+import OSLog
 import Subprocess
 
 extension Browser {
@@ -12,7 +13,11 @@ extension Browser {
             case stopped
         }
 
-        // ./chrome-headless-shell --headless  --remote-debugging-port=0      ~/Downloads/chrome-headless-shell-mac-arm64
+        enum Error: Swift.Error {
+            case timeout
+        }
+
+        let logger = Logger(subsystem: "Maestro", category: "Browser Launcher")
 
         deinit {
             print("*** Deinit")
@@ -28,71 +33,69 @@ extension Browser {
             }
         }
 
-        func launch() async throws -> URL {
-
+        func launch(timeout: ContinuousClock.Duration? = .milliseconds(250)) async throws -> URL {
             let url = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<URL, Swift.Error>) in
                 state = .launching(continuation)
                 Task {
-                    await _launch(continuation: continuation)
+                    await _launch(timeout: timeout, continuation: continuation)
                 }
             }
 
-            print("*** Done launching: \(url)")
+            logger.debug("Browser launched and listening on: \(url)")
 
             return url
         }
 
-        private func _launch(continuation: CheckedContinuation<URL, Swift.Error>) async {
+        private func _launch(timeout: ContinuousClock.Duration?, continuation: CheckedContinuation<URL, Swift.Error>) async {
             do {
                 let result = try await run(
                     .path("/Users/rdingman/Downloads/chrome-headless-shell-mac-arm64/chrome-headless-shell"),
-                    arguments: ["--headless=new", "--remote-debugging-port=0", ""],
+                    arguments: ["--headless=new", "--remote-debugging-port=0"],
                     output: .discarded,
                     error: .sequence(lowWater: 0),
                     body: { execution in
                         state = .launched(continuation, execution)
-                        //                    continuation.resume()
 
-                        print("Status: \(execution.processIdentifier)")
-                        var contents = ""
+                        logger.debug("Launched Chrome with process identifier \(execution.processIdentifier)")
+
+                        let timeoutTask: Task<Void, Never>?
+
+                        if let timeout {
+                            timeoutTask = Task {
+                                do {
+                                    try await Task.sleep(for: timeout)
+                                    guard !Task.isCancelled else { return }
+                                    didReceiveLaunchError(Error.timeout)
+                                } catch {
+                                    // Do nothing. We are expecting the CancellationError
+                                }
+                            }
+                        } else {
+                            timeoutTask = nil
+                        }
+
+                        var contents = " "
 
                         for try await chunk in execution.standardError {
                             let string = chunk.withUnsafeBytes { String(decoding: $0, as: UTF8.self) }
-                            print(string)
                             contents += string
 
                             let regex = /DevTools listening on (.+)/
                             if let result = try? regex.firstMatch(in: contents), let url = URL(string: String(result.1)) {
-                                print("Whole match: \(result.0)")
-                                print("Capture group: \(result.1)")
+                                timeoutTask?.cancel()
+
                                 guard case .launched(let continuation, _) = state else {
                                     continue
                                 }
                                 state = .running(url, execution)
                                 continuation.resume(returning: url)
                             }
-
-                            // TODO: Implement a timeout for receiving the web socket url
-
-                            //
-                            //                        if string == "Done" {
-                            //                            // Stop execution
-                            //                            await execution.teardown(
-                            //                                using: [
-                            //                                    .gracefulShutDown(
-                            //                                        allowedDurationToNextStep: .seconds(0.5)
-                            //                                    )
-                            //                                ]
-                            //                            )
-                            //                            return contents
-                            //                        }
                         }
                     })
 
-                print("Status: \(result.terminationStatus)")
                 // TODO: Handle abnormal termination status
+                logger.debug("Browser exited with status: \(result.terminationStatus)")
             } catch {
-                // TODO: Handle error
                 didReceiveLaunchError(error)
             }
         }
