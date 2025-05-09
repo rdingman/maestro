@@ -8,10 +8,47 @@ extension Browser {
             let targetId: String
             let type: String
             let title: String
-            let url: URL
+            let url: URL?
             let attached: Bool
             let canAccessOpener: Bool
             let browserContextId: String
+
+            enum CodingKeys: CodingKey {
+                case targetId
+                case type
+                case title
+                case url
+                case attached
+                case canAccessOpener
+                case browserContextId
+            }
+
+            init(from decoder: any Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                self.targetId = try container.decode(String.self, forKey: .targetId)
+                self.type = try container.decode(String.self, forKey: .type)
+                self.title = try container.decode(String.self, forKey: .title)
+
+                do {
+                    self.url = try container.decodeIfPresent(URL.self, forKey: .url)
+                } catch {
+                    let string = try container.decodeIfPresent(String.self, forKey: .url)
+
+                    if let string {
+                        if string == "" {
+                            self.url = nil
+                        } else {
+                            throw error
+                        }
+                    } else {
+                        self.url = nil
+                    }
+                }
+
+                self.attached = try container.decode(Bool.self, forKey: .attached)
+                self.canAccessOpener = try container.decode(Bool.self, forKey: .canAccessOpener)
+                self.browserContextId = try container.decode(String.self, forKey: .browserContextId)
+            }
         }
     }
 }
@@ -46,7 +83,6 @@ extension Browser.Target {
 
 extension Browser.Target {
     struct AttachToTargetCommand: Browser.Client.Command {
-        let method = "Target.attachToTarget"
         let params: Parameters
 
         init(targetId: String) {
@@ -63,7 +99,6 @@ extension Browser.Target {
     }
 
     struct CreateTargetCommand: Browser.Client.Command {
-        let method = "Target.createTarget"
         let params: Parameters
 
         init(url: URL, browserContextId: String? = nil) {
@@ -80,7 +115,6 @@ extension Browser.Target {
     }
 
     struct TargetInfoCommand: Browser.Client.Command {
-        let method = "Target.targetInfo"
         let params: Parameters
 
         init(url: URL) {
@@ -96,7 +130,6 @@ extension Browser.Target {
     }
 
     struct CloseTargetCommand: Browser.Client.Command {
-        let method = "Target.closeTarget"
         let params: Parameters
 
         init(targetId: String) {
@@ -111,8 +144,7 @@ extension Browser.Target {
         }
     }
 
-    struct CreateBrowserContextsCommand: Browser.Client.Command {
-        let method = "Target.createBrowserContext"
+    struct CreateBrowserContextCommand: Browser.Client.Command {
         let params: Parameters
 
         init() {
@@ -128,7 +160,6 @@ extension Browser.Target {
     }
 
     struct GetBrowserContextsCommand: Browser.Client.Command {
-        let method = "Target.getBrowserContexts"
         let params: Parameters
 
         init() {
@@ -144,7 +175,6 @@ extension Browser.Target {
     }
 
     struct SetDiscoverTargetsCommand: Browser.Client.Command {
-        let method = "Target.setDiscoverTargets"
         let params: Parameters
 
         init(discover: Bool) {

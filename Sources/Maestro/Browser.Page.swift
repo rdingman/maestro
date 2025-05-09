@@ -35,27 +35,37 @@ extension Browser {
     }
 }
 
+// MARK: Events
+
+extension Browser.Page {
+    struct LifecycleEvent: Browser.Client.Event {
+        static let name = "Page.lifecycleEvent"
+
+        let frameId: String
+        let loaderId: String
+        let name: String
+        let timestamp: Double
+    }
+}
+
+// MARK: Commands
+
 extension Browser.Page {
 
     struct EnableCommand: Browser.Client.Command {
-        let method = "Page.enable"
         let params: Parameters
 
-        init(targetId: String, sessionId: String, browserContextId: String) {
-            self.params = .init(targetId: targetId, sessionId: sessionId, browserContextId: browserContextId)
+        init() {
+            self.params = .init()
         }
 
         struct Parameters: Encodable {
-            let targetId: String
-            let sessionId: String
-            let browserContextId: String
         }
 
         typealias Response = Void
     }
 
     struct PrintToPDFCommand: Browser.Client.Command {
-        let method = "Page.printToPDF"
         let params: Parameters
 
         init() {
@@ -72,7 +82,6 @@ extension Browser.Page {
     }
 
     struct ReloadCommand: Browser.Client.Command {
-        let method = "Page.reload"
         let params: Parameters
 
         init() {
@@ -86,7 +95,6 @@ extension Browser.Page {
     }
 
     struct NavigateCommand: Browser.Client.Command {
-        let method = "Page.navigate"
         let params: Parameters
 
         init(url: URL) {
@@ -100,5 +108,19 @@ extension Browser.Page {
         struct Response: Decodable {
             let frameId: String
         }
+    }
+
+    struct SetLifecycleEventsEnabledCommand: Browser.Client.Command {
+        let params: Parameters
+        
+        init(enabled: Bool) {
+            self.params = .init(enabled: enabled)
+        }
+        
+        struct Parameters: Encodable {
+            let enabled: Bool
+        }
+
+        typealias Response = Void
     }
 }

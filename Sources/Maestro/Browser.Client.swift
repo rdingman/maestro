@@ -2,6 +2,7 @@
 import AsyncAlgorithms
 import Foundation
 import OSLog
+import RegexBuilder
 import Subprocess
 import System
 
@@ -14,8 +15,6 @@ extension Browser {
             case connected(Browser.Launcher, URLSessionWebSocketTask, Task<Void, Never>)
             case stopped
         }
-
-        // ./chrome-headless-shell --headless  --remote-debugging-port=0      ~/Downloads/chrome-headless-shell-mac-arm64
 
         deinit {
             print("*** Deinit")
@@ -63,18 +62,52 @@ extension Browser {
             func resume(throwing error: any Swift.Error)
         }
 
-        private var eventTypes: [String: any Event.Type] = [:]
-        let channel = AsyncChannel<any Event>()
+        protocol EventHandler: Sendable {
+            func handleEvent<E: Browser.Client.Event>(_ event: E) async
+        }
+
+        struct EventRegistration {
+            let eventType: any Event.Type
+            var handlers: [any EventHandler] = []
+        }
+
+        private var eventRegistrations: [String: EventRegistration] = [:]
 
         func registerEventType<E: Event>(_ eventType: E.Type) {
             let name = eventType.name
-            logger.debug("Registering event: \(name), type: \(String(reflecting: eventType))")
-            eventTypes[name] = eventType
+
+            if let registeredEventType = eventRegistrations[name] {
+                logger.error("Event already registered for: \(name), type: \(String(reflecting: registeredEventType))")
+            } else {
+                logger.debug("Registering event: \(name), type: \(String(reflecting: eventType))")
+                eventRegistrations[name] = EventRegistration(eventType: eventType)
+            }
         }
 
         func registerEventTypes(_ eventTypes: any Sequence<any Event.Type>) {
             for eventType in eventTypes {
                 self.registerEventType(eventType)
+            }
+        }
+
+        func registerHandler<H: EventHandler>(_ handler: H, for eventType: any Event.Type) {
+            let name = eventType.name
+
+            var eventRegistration: EventRegistration
+
+            if let registration = eventRegistrations[name] {
+                eventRegistration = registration
+                eventRegistration.handlers.append(handler)
+            } else {
+                eventRegistration = EventRegistration(eventType: eventType, handlers: [handler])
+            }
+
+            eventRegistrations[name] = eventRegistration
+        }
+
+        func registerHandler<H: EventHandler>(_ handler: H, for eventTypes: [any Event.Type]) {
+            for eventType in eventTypes {
+                registerHandler(handler, for: eventType)
             }
         }
     }
@@ -150,18 +183,44 @@ extension Browser.Client {
     }
 }
 
+private func canonicalName<T>(_ type: T.Type, suffix: String) -> String {
+    let typeName = String(reflecting: type)
+
+    let domain = Reference(Substring.self)
+    let name = Reference(Substring.self)
+    let regex = Regex {
+        Capture(as: domain) {
+            OneOrMore(CharacterClass.anyOf(".").inverted)
+        }
+        "."
+        Capture(as: name) {
+            OneOrMore(CharacterClass.anyOf(".").inverted)
+        }
+        Capture {
+            suffix
+        }
+        /$/
+    }
+
+    if let result = try? regex.firstMatch(in: typeName) {
+        let domain = result[domain]
+        let name = result[name].replacing(/^(.)/, with: { $0.output.1.lowercased() })
+
+        return "\(domain).\(name)"
+    } else {
+        return typeName
+    }
+}
+
+extension Browser.Client.Command {
+    var method: String {
+        return canonicalName(Self.self, suffix: "Command")
+    }
+}
+
 extension Browser.Client.Event {
     static var name: String {
-        let fullyQualifiedName = String(reflecting: Self.self)
-        let components = fullyQualifiedName.split(separator: ".").suffix(2)
-
-        if components.count == 2, let eventDomain = components.first, let last = components.last {
-            let withoutSuffix = last.hasSuffix("Event") ? String(last.dropLast(5)) : String(last)
-            let eventName = withoutSuffix.prefix(1).lowercased() + withoutSuffix.dropFirst()
-            return "\(eventDomain).\(eventName)"
-        } else {
-            return fullyQualifiedName
-        }
+        return canonicalName(Self.self, suffix: "Event")
     }
 }
 
@@ -227,9 +286,14 @@ extension Browser.Client {
                 } else if let method = envelope.method {
                     logger.debug("⚠️ \(String(decoding: resultData, as: UTF8.self))")
 
-                    if let eventType = eventTypes[method] {
-                        let event = try decodeEvent(eventType, from: resultData)
-                        await channel.send(event)
+                    if let eventRegistration = eventRegistrations[method] {
+                        let event = try decodeEvent(eventRegistration.eventType, from: resultData)
+
+                        for handler in eventRegistration.handlers {
+                            Task.detached {
+                                await handler.handleEvent(event)
+                            }
+                        }
                     } else {
                         logger.error("**** No event type found for method: \(method)")
                     }

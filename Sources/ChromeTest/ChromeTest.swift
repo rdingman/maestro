@@ -11,8 +11,8 @@ struct ChromeTest: AsyncParsableCommand {
         let browser = try await Browser()
 
         let page = try await browser.newPage()
-        try await Task.sleep(for: .seconds(5))
-        try await page.navigation(to: URL(string: "https://www.lkajsdflkjasdlfkjasldkfj.com/")!)
+//        try await Task.sleep(for: .seconds(5))
+        try await page.navigation(to: URL(string: "https://www.apple.com/")!)
 
         try await page.reload()
         try await Task.sleep(for: .seconds(5))
